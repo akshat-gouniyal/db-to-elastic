@@ -42,7 +42,7 @@ public class Main {
         long startTime = System.currentTimeMillis(); // Start timing
 
         // Max records variable; set to -1 for no limit or specify a number (e.g., 1000000)
-        int maxRecords = 1000; // Change this value as needed (e.g., 1000000 for one million)
+        int maxRecords = 60000; // Change this value as needed (e.g., 1000000 for one million)
 
         try (
                 Connection connection = DriverManager.getConnection(jdbcUrl, jdbcUser, jdbcPassword);
