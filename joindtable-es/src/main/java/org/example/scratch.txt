@@ -1,0 +1,161 @@
+package org.example;
+
+import co.elastic.clients.elasticsearch.ElasticsearchClient;
+import co.elastic.clients.elasticsearch.core.BulkRequest;
+import co.elastic.clients.elasticsearch.core.BulkResponse;
+import co.elastic.clients.elasticsearch.core.bulk.BulkOperation;
+import co.elastic.clients.json.jackson.JacksonJsonpMapper;
+import co.elastic.clients.transport.rest_client.RestClientTransport;
+import org.apache.http.HttpHost;
+import org.elasticsearch.client.RestClient;
+
+import java.io.IOException;
+import java.sql.*;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+public class Main {
+
+    private static final String JDBC_URL = "jdbc:postgresql://localhost:5432/elasticproducttest"; // Modify with your actual db details
+    private static final String JDBC_USER = "postgres";
+    private static final String JDBC_PASSWORD = "Logik2021";
+    private static final String ES_HOST = "localhost";
+    private static final int ES_PORT = 9200;
+    private static final String INDEX_NAME = "joinedtable"; // Elasticsearch index name
+
+    public static void main(String[] args) {
+        int batchSize = 10000; // Number of records to fetch per batch
+        int offset = 0; // Starting point for fetching records
+
+        long overallStartTime = System.currentTimeMillis(); // Start timing for overall execution
+
+        try (
+                RestClient restClient = RestClient.builder(new HttpHost(ES_HOST, ES_PORT)).build();
+                RestClientTransport transport = new RestClientTransport(restClient, new JacksonJsonpMapper());
+                ElasticsearchClient client = new ElasticsearchClient(transport);
+                Connection connection = DriverManager.getConnection(JDBC_URL, JDBC_USER, JDBC_PASSWORD)
+        ) {
+            // Check if the index exists and create it if it does not
+            if (!client.indices().exists(r -> r.index(INDEX_NAME)).value()) {
+                client.indices().create(c -> c.index(INDEX_NAME));
+                System.out.println("Index created: " + INDEX_NAME);
+            } else {
+                System.out.println("Index already exists: " + INDEX_NAME);
+            }
+
+            // Prepare the SQL query with placeholders for LIMIT and OFFSET
+            String sqlQuery = "SELECT " +
+                    "p.product_code, " +
+                    "p.active AS product_active, " +
+                    "p.modified, " +
+                    "i.product_number AS inventory_product_number, " +
+                    "i.l_type AS inventory_l_type, " +
+                    "i.enabled_flag AS inventory_enabled_flag, " +
+                    "k.hwmodel AS coresw_hwmodel, " +
+                    "k.pl AS coresw_pl, " +
+                    "l.product_code AS large_data_product_code, " +
+                    "l.Active AS large_data_Active " +
+                    "FROM product p " +
+                    "LEFT JOIN inventory_items i ON i.product_number = p.product_code " +
+                    "LEFT JOIN ks_coreswduration k ON k.hwmodel = p.product_code " +
+                    "LEFT JOIN LargeDataTable l ON l.Product_Code = p.product_code " +
+                    "LIMIT ? OFFSET ?";
+
+            PreparedStatement preparedStatement = connection.prepareStatement(sqlQuery);
+
+            while (true) {
+                // Set the LIMIT and OFFSET values
+                preparedStatement.setInt(1, batchSize);
+                preparedStatement.setInt(2, offset);
+
+                // Execute the query
+                ResultSet resultSet = preparedStatement.executeQuery();
+
+                // Check if there are any results
+                if (!resultSet.next()) {
+                    break; // Exit if no more records are found
+                }
+
+                // Create a bulk request for Elasticsearch
+                List<BulkOperation> bulkOperations = new ArrayList<>();
+
+                do {
+                    Map<String, Object> documentMap = new HashMap<>();
+
+                    // Populate document map with result set data
+                    documentMap.put("product_code", resultSet.getString("product_code"));
+                    documentMap.put("product_active", resultSet.getBoolean("product_active"));
+                    documentMap.put("modified", resultSet.getTimestamp("modified"));
+                    documentMap.put("inventory_product_number", resultSet.getString("inventory_product_number"));
+                    documentMap.put("inventory_l_type", resultSet.getString("inventory_l_type"));
+
+                    // Handle enabled_flag conversion from 'Y'/'N' or empty string
+                    String enabledFlagValue = resultSet.getString("inventory_enabled_flag");
+                    Boolean inventoryEnabledFlag;
+
+                    if ("Y".equals(enabledFlagValue)) {
+                        inventoryEnabledFlag = true;
+                    } else if ("N".equals(enabledFlagValue)) {
+                        inventoryEnabledFlag = false;
+                    } else {
+                        inventoryEnabledFlag = null; // or false depending on your requirements
+                    }
+
+                    documentMap.put("inventory_enabled_flag", inventoryEnabledFlag);
+
+                    documentMap.put("coresw_hwmodel", resultSet.getString("coresw_hwmodel"));
+                    documentMap.put("coresw_pl", resultSet.getString("coresw_pl"));
+                    documentMap.put("large_data_product_code", resultSet.getString("large_data_product_code"));
+                    documentMap.put("large_data_Active", resultSet.getBoolean("large_data_Active"));
+
+                    // Use product_code as a unique ID for each document
+                    String documentId = resultSet.getString("product_code") + "_" + offset;
+
+                    // Add each document to the bulk operations list
+                    bulkOperations.add(BulkOperation.of(b -> b.index(idx -> idx
+                            .index(INDEX_NAME) // Use Elasticsearch index name here
+                            .id(documentId)     // Unique ID for each document
+                            .document(documentMap))));
+
+                } while (resultSet.next());
+
+                if (!bulkOperations.isEmpty()) {
+                    BulkRequest bulkRequest = BulkRequest.of(b -> b.operations(bulkOperations));
+                    BulkResponse bulkResponse = client.bulk(bulkRequest);
+
+                    if (bulkResponse.errors()) {
+                        System.err.println("Bulk indexing had failures.");
+                        bulkResponse.items().forEach(item -> {
+                            if (item.error() != null) {
+                                System.err.println("Error indexing document ID: "
+                                        + item.id() + ", Error: "
+                                        + item.error().reason());
+                            }
+                        });
+                    } else {
+                        System.out.println("Successfully indexed batch with OFFSET: "
+                                + offset);
+                    }
+                }
+
+                offset += batchSize; // Update offset for the next batch
+            }
+
+            preparedStatement.close();
+            connection.close();
+
+            long overallEndTime = System.currentTimeMillis(); // End timing for overall execution
+            System.out.println("All records have been indexed successfully.");
+            System.out.println("Total time taken for indexing: "
+                    + (overallEndTime - overallStartTime) + " milliseconds");
+
+        } catch (SQLException e) {
+            e.printStackTrace();
+        } catch (IOException e) {
+            System.err.println("Error while interacting with Elasticsearch: "
+                    + e.getMessage());
+        }
+    }
+}
