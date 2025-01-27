@@ -24,7 +24,7 @@ public class SearchService {
 
         // Build a query to find documents where 'active' is false
         sourceBuilder.query(QueryBuilders.termQuery("active", false));
-        sourceBuilder.query(QueryBuilders.termQuery("src_table", "inventory_items"));
+//        sourceBuilder.query(QueryBuilders.termQuery("src_table", "inventory_items"));
 
         searchRequest.source(sourceBuilder);
 
